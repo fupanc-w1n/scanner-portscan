@@ -84,6 +84,26 @@ func (d *DB) InsertPortResults(ctx context.Context, rows []PortResult) error {
 	return err
 }
 
+// DeletePortResultsForHosts 删除当前分片当前 host 子集的旧端口结果。
+// Worker 消息如果因为下游投递失败或 ACK 失败进入 PEL 重试,这里保证端口结果展示幂等。
+func (d *DB) DeletePortResultsForHosts(ctx context.Context, taskID uint64, partName string, hosts []string) error {
+	if len(hosts) == 0 {
+		return nil
+	}
+	q := "DELETE FROM port_results WHERE task_id = ? AND task_part_name = ? AND host IN ("
+	args := []interface{}{taskID, partName}
+	for i, host := range hosts {
+		if i > 0 {
+			q += ","
+		}
+		q += "?"
+		args = append(args, host)
+	}
+	q += ")"
+	_, err := d.conn.ExecContext(ctx, q, args...)
+	return err
+}
+
 // ServiceResult nmap 服务识别写入
 type ServiceResult struct {
 	TaskID       uint64
@@ -166,12 +186,12 @@ type OpenPortRow struct {
 	Port int
 }
 
-// QueryOpenPorts 按 task_id + hosts 查询开放端口(服务识别 Pod 使用)
-func (d *DB) QueryOpenPorts(ctx context.Context, taskID uint64, hosts []string) ([]OpenPortRow, error) {
+// QueryOpenPorts 按 task_id + task_part_name + hosts 查询开放端口(服务识别 Pod 使用)
+func (d *DB) QueryOpenPorts(ctx context.Context, taskID uint64, partName string, hosts []string) ([]OpenPortRow, error) {
 	if len(hosts) == 0 {
 		return nil, nil
 	}
-	q, args := buildHostIn("SELECT host, port FROM port_results WHERE task_id = ?", taskID, hosts)
+	q, args := buildHostIn("SELECT host, port FROM port_results WHERE task_id = ?", taskID, partName, hosts)
 	rows, err := d.conn.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
@@ -198,12 +218,12 @@ type ServiceTarget struct {
 // QueryServiceTargets 下游模块查询当前批次 host 的服务目标
 //
 // services 过滤(空表示不过滤)
-func (d *DB) QueryServiceTargets(ctx context.Context, taskID uint64, hosts, services []string) ([]ServiceTarget, error) {
+func (d *DB) QueryServiceTargets(ctx context.Context, taskID uint64, partName string, hosts, services []string) ([]ServiceTarget, error) {
 	if len(hosts) == 0 {
 		return nil, nil
 	}
 	base := "SELECT host, port, service FROM service_results WHERE task_id = ?"
-	q, args := buildHostIn(base, taskID, hosts)
+	q, args := buildHostIn(base, taskID, partName, hosts)
 	if len(services) > 0 {
 		q += " AND service IN ("
 		for i, s := range services {
@@ -231,9 +251,9 @@ func (d *DB) QueryServiceTargets(ctx context.Context, taskID uint64, hosts, serv
 	return out, rows.Err()
 }
 
-func buildHostIn(base string, taskID uint64, hosts []string) (string, []interface{}) {
-	q := base + " AND host IN ("
-	args := []interface{}{taskID}
+func buildHostIn(base string, taskID uint64, partName string, hosts []string) (string, []interface{}) {
+	q := base + " AND task_part_name = ? AND host IN ("
+	args := []interface{}{taskID, partName}
 	for i, h := range hosts {
 		if i > 0 {
 			q += ","

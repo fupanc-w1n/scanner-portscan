@@ -1,7 +1,8 @@
 // Package worker 提供 Scanner Pod 共享的运行框架(架构 §9)。
 // 主循环顺序:
-//   1) PEL 中 idle 超阈值的消息:先 messageID 加锁 -> XCLAIM -> handler -> ACK -> 释放锁
-//   2) 没有可处理 PEL 时再 XREADGROUP > 读新消息:加锁 -> handler -> ACK -> 释放锁
+//  1. PEL 中 idle 超阈值的消息:先 messageID 加锁 -> XCLAIM -> handler -> ACK -> 释放锁
+//  2. 没有可处理 PEL 时再 XREADGROUP > 读新消息:加锁 -> handler -> ACK -> 释放锁
+//
 // 终止/暂停由 broadcast.State 维护;锁 key 派生 lock:stream:{stream}:message:{messageID}。
 package worker
 
@@ -43,8 +44,8 @@ type Handler func(ctx context.Context, msg *BusinessMessage, msgID string) Handl
 
 // Worker 一个完整的 Scanner Pod 运行单元。Module 各 cmd/main 构造并 Run。
 type Worker struct {
-	Cfg         *scannerconfig.Config
-	RDB         *redis.Client
+	Cfg          *scannerconfig.Config
+	RDB          *redis.Client
 	ConsumerName string
 	Handler      Handler
 	State        *broadcast.State
@@ -184,7 +185,7 @@ func (w *Worker) handleMessage(ctx context.Context, m redis.XMessage, lockKey st
 	if err != nil {
 		log.Printf("[%s] invalid message %s: %v", w.Cfg.Module, m.ID, err)
 		// 视为非法消息,ACK 释放,避免无限重试
-		_ = w.RDB.XAck(ctx, w.Cfg.Redis.Stream, w.Cfg.Redis.Group, m.ID).Err()
+		w.ackMessage(ctx, m.ID, "invalid")
 		return
 	}
 
@@ -196,7 +197,7 @@ func (w *Worker) handleMessage(ctx context.Context, m redis.XMessage, lockKey st
 	// 终止:跳过扫描并 ACK
 	if w.State.IsTerminated(bm.TaskID) {
 		log.Printf("[%s] task %d terminated, skip+ack msg %s", w.Cfg.Module, bm.TaskID, m.ID)
-		_ = w.RDB.XAck(ctx, w.Cfg.Redis.Stream, w.Cfg.Redis.Group, m.ID).Err()
+		w.ackMessage(ctx, m.ID, "terminated-before-handler")
 		return
 	}
 
@@ -214,7 +215,7 @@ func (w *Worker) handleMessage(ctx context.Context, m redis.XMessage, lockKey st
 
 	// 处理完后再检查终止状态:已终止则不投递下游
 	if w.State.IsTerminated(bm.TaskID) {
-		_ = w.RDB.XAck(ctx, w.Cfg.Redis.Stream, w.Cfg.Redis.Group, m.ID).Err()
+		w.ackMessage(ctx, m.ID, "terminated-after-handler")
 		return
 	}
 
@@ -241,7 +242,18 @@ func (w *Worker) handleMessage(ctx context.Context, m redis.XMessage, lockKey st
 		}
 	}
 
-	_ = w.RDB.XAck(ctx, w.Cfg.Redis.Stream, w.Cfg.Redis.Group, m.ID).Err()
+	w.ackMessage(ctx, m.ID, "success")
+}
+
+func (w *Worker) ackMessage(ctx context.Context, msgID, reason string) {
+	n, err := w.RDB.XAck(ctx, w.Cfg.Redis.Stream, w.Cfg.Redis.Group, msgID).Result()
+	if err != nil {
+		log.Printf("[%s] xack msg=%s reason=%s err=%v", w.Cfg.Module, msgID, reason, err)
+		return
+	}
+	if n == 0 {
+		log.Printf("[%s] xack msg=%s reason=%s acked=0 stream=%s group=%s", w.Cfg.Module, msgID, reason, w.Cfg.Redis.Stream, w.Cfg.Redis.Group)
+	}
 }
 
 func (w *Worker) renewLoop(ctx context.Context, key string) {

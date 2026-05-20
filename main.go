@@ -89,6 +89,8 @@ func main() {
 func handlePort(ctx context.Context, cfg *scannerconfig.Config, mc *scannerconfig.PortScanConfig, ports []int,
 	mdb *mysqldb.DB, msg *worker.BusinessMessage) worker.HandlerResult {
 
+	log.Printf("portscan task=%d part=%s hosts=%v", msg.TaskID, msg.TaskPartName, msg.Hosts)
+
 	type hostScanResult struct {
 		host string
 		rows []mysqldb.PortResult
@@ -112,6 +114,9 @@ func handlePort(ctx context.Context, cfg *scannerconfig.Config, mc *scannerconfi
 			rows = append(rows, result.rows...)
 		}
 		log.Printf("portscan task=%d part=%s host=%s open_ports=%d", msg.TaskID, msg.TaskPartName, result.host, len(result.rows))
+	}
+	if err := mdb.DeletePortResultsForHosts(ctx, msg.TaskID, msg.TaskPartName, msg.Hosts); err != nil {
+		return worker.HandlerResult{Err: fmt.Errorf("delete old ports: %w", err)}
 	}
 	if err := mdb.InsertPortResults(ctx, rows); err != nil {
 		return worker.HandlerResult{Err: fmt.Errorf("insert ports: %w", err)}
