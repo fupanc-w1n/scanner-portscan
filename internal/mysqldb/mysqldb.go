@@ -5,6 +5,7 @@ package mysqldb
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
@@ -113,7 +114,6 @@ type ServiceResult struct {
 	Service      string
 	Product      string
 	Version      string
-	RouteTo      string
 }
 
 // InsertServiceResults 批量写入服务识别
@@ -122,14 +122,14 @@ func (d *DB) InsertServiceResults(ctx context.Context, rows []ServiceResult) err
 		return nil
 	}
 	var sb strings.Builder
-	sb.WriteString("INSERT INTO service_results(task_id,task_part_name,host,port,protocol,state,service,product,version,route_to,created_at) VALUES ")
-	args := make([]interface{}, 0, len(rows)*11)
+	sb.WriteString("INSERT INTO service_results(task_id,task_part_name,host,port,protocol,state,service,product,version,created_at) VALUES ")
+	args := make([]interface{}, 0, len(rows)*10)
 	for i, r := range rows {
 		if i > 0 {
 			sb.WriteString(",")
 		}
-		sb.WriteString("(?,?,?,?,?,?,?,?,?,?,?)")
-		args = append(args, r.TaskID, r.TaskPartName, r.Host, r.Port, "tcp", "open", r.Service, r.Product, r.Version, r.RouteTo, time.Now())
+		sb.WriteString("(?,?,?,?,?,?,?,?,?,?)")
+		args = append(args, r.TaskID, r.TaskPartName, r.Host, r.Port, "tcp", "open", r.Service, r.Product, r.Version, time.Now())
 	}
 	_, err := d.conn.ExecContext(ctx, sb.String(), args...)
 	return err
@@ -180,6 +180,22 @@ func (d *DB) InsertWeakPassFinding(ctx context.Context, f WeakPassFinding) error
 	return err
 }
 
+// InsertTaskEvent 写入任务时间线事件。事件用于前端展示,不参与扫描主状态判断。
+func (d *DB) InsertTaskEvent(ctx context.Context, taskID uint64, level, module, message string, meta interface{}) error {
+	metaJSON := ""
+	if meta != nil {
+		b, err := json.Marshal(meta)
+		if err != nil {
+			return err
+		}
+		metaJSON = string(b)
+	}
+	_, err := d.conn.ExecContext(ctx,
+		`INSERT INTO task_events(task_id,level,module,message,meta_json,created_at) VALUES(?,?,?,?,?,?)`,
+		taskID, level, module, message, metaJSON, time.Now())
+	return err
+}
+
 // OpenPortRow 查询开放端口
 type OpenPortRow struct {
 	Host string
@@ -215,26 +231,25 @@ type ServiceTarget struct {
 	Service string
 }
 
-// QueryServiceTargets 下游模块查询当前批次 host 的服务目标
-//
-// services 过滤(空表示不过滤)
-func (d *DB) QueryServiceTargets(ctx context.Context, taskID uint64, partName string, hosts, services []string) ([]ServiceTarget, error) {
+// QueryHTTPServiceTargets 查询当前批次的 HTTP/Web 服务目标。
+func (d *DB) QueryHTTPServiceTargets(ctx context.Context, taskID uint64, partName string, hosts []string) ([]ServiceTarget, error) {
+	return d.queryServiceTargets(ctx, taskID, partName, hosts,
+		" AND (LOWER(service) IN ('http','https','http-proxy','http-alt') OR LOWER(service) LIKE '%http%')")
+}
+
+// QueryWeakPassServiceTargets 查询当前批次弱口令支持服务目标。
+func (d *DB) QueryWeakPassServiceTargets(ctx context.Context, taskID uint64, partName string, hosts []string) ([]ServiceTarget, error) {
+	return d.queryServiceTargets(ctx, taskID, partName, hosts,
+		" AND LOWER(service) IN ('ssh','mysql','redis')")
+}
+
+func (d *DB) queryServiceTargets(ctx context.Context, taskID uint64, partName string, hosts []string, extraWhere string) ([]ServiceTarget, error) {
 	if len(hosts) == 0 {
 		return nil, nil
 	}
 	base := "SELECT host, port, service FROM service_results WHERE task_id = ?"
 	q, args := buildHostIn(base, taskID, partName, hosts)
-	if len(services) > 0 {
-		q += " AND service IN ("
-		for i, s := range services {
-			if i > 0 {
-				q += ","
-			}
-			q += "?"
-			args = append(args, s)
-		}
-		q += ")"
-	}
+	q += extraWhere
 	rows, err := d.conn.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
@@ -269,33 +284,35 @@ func buildHostIn(base string, taskID uint64, partName string, hosts []string) (s
 
 // SetPortScanCompleted portscan_status -> completed
 func (d *DB) SetPortScanCompleted(ctx context.Context, taskID uint64, partName string) error {
-	_, err := d.conn.ExecContext(ctx,
-		`UPDATE task_parts_progress SET portscan_status='completed', updated_at=? WHERE task_id=? AND task_part_name=?`,
-		time.Now(), taskID, partName)
-	return err
+	return d.setModuleStatus(ctx, taskID, partName, "portscan_status", "completed")
 }
 
 // SetNmapStatus 设置 nmap_status
 func (d *DB) SetNmapStatus(ctx context.Context, taskID uint64, partName, status string) error {
-	_, err := d.conn.ExecContext(ctx,
-		`UPDATE task_parts_progress SET nmap_status=?, updated_at=? WHERE task_id=? AND task_part_name=?`,
-		status, time.Now(), taskID, partName)
-	return err
+	return d.setModuleStatus(ctx, taskID, partName, "nmap_status", status)
 }
 
 // SetNucleiStatus 设置 nuclei_status
 func (d *DB) SetNucleiStatus(ctx context.Context, taskID uint64, partName, status string) error {
-	_, err := d.conn.ExecContext(ctx,
-		`UPDATE task_parts_progress SET nuclei_status=?, updated_at=? WHERE task_id=? AND task_part_name=?`,
-		status, time.Now(), taskID, partName)
-	return err
+	return d.setModuleStatus(ctx, taskID, partName, "nuclei_status", status)
 }
 
 // SetWeakPassStatus 设置 weakpass_status
 func (d *DB) SetWeakPassStatus(ctx context.Context, taskID uint64, partName, status string) error {
-	_, err := d.conn.ExecContext(ctx,
-		`UPDATE task_parts_progress SET weakpass_status=?, updated_at=? WHERE task_id=? AND task_part_name=?`,
-		status, time.Now(), taskID, partName)
+	return d.setModuleStatus(ctx, taskID, partName, "weakpass_status", status)
+}
+
+func (d *DB) setModuleStatus(ctx context.Context, taskID uint64, partName, column, status string) error {
+	now := time.Now()
+	if status == "running" {
+		q := fmt.Sprintf(`UPDATE task_parts_progress SET %s=?, updated_at=?
+            WHERE task_id=? AND task_part_name=? AND %s IS NOT NULL AND %s<>'completed'`, column, column, column)
+		_, err := d.conn.ExecContext(ctx, q, status, now, taskID, partName)
+		return err
+	}
+	q := fmt.Sprintf(`UPDATE task_parts_progress SET %s=?, updated_at=?
+        WHERE task_id=? AND task_part_name=? AND %s IS NOT NULL`, column, column)
+	_, err := d.conn.ExecContext(ctx, q, status, now, taskID, partName)
 	return err
 }
 
@@ -328,9 +345,8 @@ func (d *DB) MarkPartCompletedIfAllDone(ctx context.Context, taskID uint64, part
 		return false, err
 	}
 	n, _ := res.RowsAffected()
-	if n > 0 {
-		// 同时 try to mark task completed if all parts completed
-		_ = d.MarkTaskCompletedIfAllDone(ctx, taskID)
+	if err := d.MarkTaskCompletedIfAllDone(ctx, taskID); err != nil {
+		return n > 0, err
 	}
 	return n > 0, nil
 }

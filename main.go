@@ -57,7 +57,7 @@ func main() {
 	}
 	defer rdb.Close()
 
-	mdb, err := mysqldb.Open(cfg.MySQLAddr(), envOr("DAST_DB_USER", "root"), envOr("DAST_DB_PASS", "root"), envOr("DAST_DB_NAME", "dast"))
+	mdb, err := mysqldb.Open(cfg.MySQLAddr(), envOr("DAST_DB_USER", "root"), envOr("DAST_DB_PASS", "fupanC@123"), envOr("DAST_DB_NAME", "dast"))
 	if err != nil {
 		log.Fatalf("mysql open: %v", err)
 	}
@@ -113,7 +113,9 @@ func handlePort(ctx context.Context, cfg *scannerconfig.Config, mc *scannerconfi
 			openByHost[result.host] = struct{}{}
 			rows = append(rows, result.rows...)
 		}
-		log.Printf("portscan task=%d part=%s host=%s open_ports=%d", msg.TaskID, msg.TaskPartName, result.host, len(result.rows))
+	}
+	if err := ctx.Err(); err != nil {
+		return worker.HandlerResult{Err: err}
 	}
 	if err := mdb.DeletePortResultsForHosts(ctx, msg.TaskID, msg.TaskPartName, msg.Hosts); err != nil {
 		return worker.HandlerResult{Err: fmt.Errorf("delete old ports: %w", err)}
@@ -123,9 +125,17 @@ func handlePort(ctx context.Context, cfg *scannerconfig.Config, mc *scannerconfi
 	}
 
 	// 任务终止检查
-	if term, _ := mdb.IsTaskTerminated(ctx, msg.TaskID); term {
-		_ = mdb.SetPortScanCompleted(ctx, msg.TaskID, msg.TaskPartName)
-		_, _ = mdb.MarkPartCompletedIfAllDone(ctx, msg.TaskID, msg.TaskPartName)
+	term, err := mdb.IsTaskTerminated(ctx, msg.TaskID)
+	if err != nil {
+		return worker.HandlerResult{Err: fmt.Errorf("check task terminated: %w", err)}
+	}
+	if term {
+		if err := mdb.SetPortScanCompleted(ctx, msg.TaskID, msg.TaskPartName); err != nil {
+			return worker.HandlerResult{Err: err}
+		}
+		if _, err := mdb.MarkPartCompletedIfAllDone(ctx, msg.TaskID, msg.TaskPartName); err != nil {
+			return worker.HandlerResult{Err: err}
+		}
 		return worker.HandlerResult{}
 	}
 
@@ -135,13 +145,19 @@ func handlePort(ctx context.Context, cfg *scannerconfig.Config, mc *scannerconfi
 			openHosts = append(openHosts, h)
 		}
 	}
+	log.Printf("portscan task=%d part=%s scanned_hosts=%d open_hosts=%d result_rows=%d", msg.TaskID, msg.TaskPartName, len(msg.Hosts), len(openHosts), len(rows))
+	recordTaskEvent(ctx, mdb, msg.TaskID, "portscan",
+		fmt.Sprintf("portscan part completed: part=%s scanned_hosts=%d open_hosts=%d open_ports=%d", msg.TaskPartName, len(msg.Hosts), len(openHosts), len(rows)),
+		map[string]interface{}{"task_part_name": msg.TaskPartName, "scanned_hosts": len(msg.Hosts), "open_hosts": len(openHosts), "open_ports": len(rows)})
 
 	// 无开放 host:把所有非 NULL 模块字段标完成,然后检查分片完成,不投递下游
 	if len(openHosts) == 0 {
 		if err := mdb.CompleteAllNonNullStatuses(ctx, msg.TaskID, msg.TaskPartName); err != nil {
 			return worker.HandlerResult{Err: err}
 		}
-		_, _ = mdb.MarkPartCompletedIfAllDone(ctx, msg.TaskID, msg.TaskPartName)
+		if _, err := mdb.MarkPartCompletedIfAllDone(ctx, msg.TaskID, msg.TaskPartName); err != nil {
+			return worker.HandlerResult{Err: err}
+		}
 		return worker.HandlerResult{}
 	}
 
@@ -152,11 +168,15 @@ func handlePort(ctx context.Context, cfg *scannerconfig.Config, mc *scannerconfi
 
 	out := worker.HandlerResult{DownstreamHosts: map[string][]string{}}
 	if _, ok := cfg.Workflow.Downstreams["open_port"]; ok {
-		// 标记 nmap_status = running
-		_ = mdb.SetNmapStatus(ctx, msg.TaskID, msg.TaskPartName, "running")
+		if err := mdb.SetNmapStatus(ctx, msg.TaskID, msg.TaskPartName, "running"); err != nil {
+			return worker.HandlerResult{Err: err}
+		}
 		out.DownstreamHosts["open_port"] = openHosts
+		log.Printf("portscan task=%d part=%s downstream=open_port hosts=%d", msg.TaskID, msg.TaskPartName, len(openHosts))
 	}
-	_, _ = mdb.MarkPartCompletedIfAllDone(ctx, msg.TaskID, msg.TaskPartName)
+	if _, err := mdb.MarkPartCompletedIfAllDone(ctx, msg.TaskID, msg.TaskPartName); err != nil {
+		return worker.HandlerResult{Err: err}
+	}
 	return out
 }
 
@@ -239,4 +259,10 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+func recordTaskEvent(ctx context.Context, mdb *mysqldb.DB, taskID uint64, module, message string, meta map[string]interface{}) {
+	if err := mdb.InsertTaskEvent(ctx, taskID, "info", module, message, meta); err != nil {
+		log.Printf("%s task=%d event insert err=%v", module, taskID, err)
+	}
 }

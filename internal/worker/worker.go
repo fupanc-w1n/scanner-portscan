@@ -117,7 +117,11 @@ func (w *Worker) tryProcessPending(ctx context.Context) bool {
 		End:    "+",
 		Count:  10,
 	}).Result()
-	if err != nil || len(pending) == 0 {
+	if err != nil {
+		log.Printf("[%s] xpending stream=%s group=%s err=%v", w.Cfg.Module, w.Cfg.Redis.Stream, w.Cfg.Redis.Group, err)
+		return false
+	}
+	if len(pending) == 0 {
 		return false
 	}
 	for _, p := range pending {
@@ -126,8 +130,11 @@ func (w *Worker) tryProcessPending(ctx context.Context) bool {
 		}
 		key := lockKey(w.Cfg.Redis.Stream, p.ID)
 		ok, err := w.acquireLock(ctx, key)
-		if err != nil || !ok {
-			// 已被其他 Pod 锁定,跳过
+		if err != nil {
+			log.Printf("[%s] acquire lock key=%s err=%v", w.Cfg.Module, key, err)
+			continue
+		}
+		if !ok {
 			continue
 		}
 		msgs, err := w.RDB.XClaim(ctx, &redis.XClaimArgs{
@@ -137,8 +144,17 @@ func (w *Worker) tryProcessPending(ctx context.Context) bool {
 			MinIdle:  w.PendingIdle,
 			Messages: []string{p.ID},
 		}).Result()
-		if err != nil || len(msgs) == 0 {
-			_ = w.releaseLock(ctx, key)
+		if err != nil {
+			log.Printf("[%s] xclaim msg=%s err=%v", w.Cfg.Module, p.ID, err)
+			if err := w.releaseLock(ctx, key); err != nil {
+				log.Printf("[%s] release lock key=%s after xclaim err: %v", w.Cfg.Module, key, err)
+			}
+			continue
+		}
+		if len(msgs) == 0 {
+			if err := w.releaseLock(ctx, key); err != nil {
+				log.Printf("[%s] release lock key=%s after empty xclaim err: %v", w.Cfg.Module, key, err)
+			}
 			continue
 		}
 		w.handleMessage(ctx, msgs[0], key)
@@ -169,8 +185,11 @@ func (w *Worker) tryProcessNew(ctx context.Context) {
 	for _, m := range streams[0].Messages {
 		key := lockKey(w.Cfg.Redis.Stream, m.ID)
 		ok, err := w.acquireLock(ctx, key)
-		if err != nil || !ok {
-			// 加锁失败:跳过,不 ACK,等待 PEL 恢复
+		if err != nil {
+			log.Printf("[%s] acquire lock key=%s err=%v", w.Cfg.Module, key, err)
+			continue
+		}
+		if !ok {
 			continue
 		}
 		w.handleMessage(ctx, m, key)
@@ -179,7 +198,11 @@ func (w *Worker) tryProcessNew(ctx context.Context) {
 
 // handleMessage 处理单条业务消息。锁必须释放;成功路径 ACK,失败路径不 ACK。
 func (w *Worker) handleMessage(ctx context.Context, m redis.XMessage, lockKey string) {
-	defer func() { _ = w.releaseLock(ctx, lockKey) }()
+	defer func() {
+		if err := w.releaseLock(ctx, lockKey); err != nil {
+			log.Printf("[%s] release lock key=%s err=%v", w.Cfg.Module, lockKey, err)
+		}
+	}()
 
 	bm, err := parseBusiness(m)
 	if err != nil {
@@ -201,21 +224,27 @@ func (w *Worker) handleMessage(ctx context.Context, m redis.XMessage, lockKey st
 		return
 	}
 
-	// 锁续期 goroutine
+	// 锁续期 goroutine。续期失败时取消业务 context,避免锁已丢失还继续写结果/ACK。
+	processCtx, cancelProcess := context.WithCancel(ctx)
+	defer cancelProcess()
 	renewCtx, cancelRenew := context.WithCancel(ctx)
 	defer cancelRenew()
-	go w.renewLoop(renewCtx, lockKey)
+	go w.renewLoop(renewCtx, lockKey, cancelProcess)
 
 	// 业务处理
-	res := w.Handler(ctx, bm, m.ID)
+	res := w.Handler(processCtx, bm, m.ID)
 	if res.Err != nil {
 		log.Printf("[%s] handler error msg=%s: %v", w.Cfg.Module, m.ID, res.Err)
 		return // 不 ACK,等待 PEL 重试
 	}
+	if err := processCtx.Err(); err != nil {
+		log.Printf("[%s] process context done msg=%s: %v", w.Cfg.Module, m.ID, err)
+		return // 续期失败或上层取消时不 ACK
+	}
 
 	// 处理完后再检查终止状态:已终止则不投递下游
 	if w.State.IsTerminated(bm.TaskID) {
-		w.ackMessage(ctx, m.ID, "terminated-after-handler")
+		w.ackMessage(processCtx, m.ID, "terminated-after-handler")
 		return
 	}
 
@@ -229,20 +258,26 @@ func (w *Worker) handleMessage(ctx context.Context, m redis.XMessage, lockKey st
 			continue
 		}
 		hostsJSON, _ := json.Marshal(hosts)
-		if _, err := w.RDB.XAdd(ctx, &redis.XAddArgs{
+		downstreamID, err := w.RDB.XAdd(processCtx, &redis.XAddArgs{
 			Stream: ds.Stream,
 			Values: map[string]interface{}{
 				"task_id":        bm.TaskID,
 				"task_part_name": bm.TaskPartName,
 				"hosts":          string(hostsJSON),
 			},
-		}).Result(); err != nil {
+		}).Result()
+		if err != nil {
 			log.Printf("[%s] xadd downstream %s err: %v", w.Cfg.Module, ds.Stream, err)
 			return // 不 ACK,留待重试
 		}
+		log.Printf("[%s] xadd downstream key=%s stream=%s msg=%s downstream_msg=%s hosts=%d", w.Cfg.Module, key, ds.Stream, m.ID, downstreamID, len(hosts))
 	}
 
-	w.ackMessage(ctx, m.ID, "success")
+	if err := processCtx.Err(); err != nil {
+		log.Printf("[%s] process context done before ack msg=%s: %v", w.Cfg.Module, m.ID, err)
+		return
+	}
+	w.ackMessage(processCtx, m.ID, "success")
 }
 
 func (w *Worker) ackMessage(ctx context.Context, msgID, reason string) {
@@ -256,7 +291,7 @@ func (w *Worker) ackMessage(ctx context.Context, msgID, reason string) {
 	}
 }
 
-func (w *Worker) renewLoop(ctx context.Context, key string) {
+func (w *Worker) renewLoop(ctx context.Context, key string, cancelProcessing context.CancelFunc) {
 	if w.LockRenew <= 0 {
 		return
 	}
@@ -267,7 +302,17 @@ func (w *Worker) renewLoop(ctx context.Context, key string) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			_, _ = w.renewLock(ctx, key)
+			ok, err := w.renewLock(ctx, key)
+			if err != nil {
+				log.Printf("[%s] renew lock key=%s err=%v", w.Cfg.Module, key, err)
+				cancelProcessing()
+				return
+			}
+			if !ok {
+				log.Printf("[%s] renew lock key=%s failed: lock owner changed or expired", w.Cfg.Module, key)
+				cancelProcessing()
+				return
+			}
 		}
 	}
 }
@@ -284,11 +329,17 @@ func (w *Worker) acquireLock(ctx context.Context, key string) (bool, error) {
 
 func (w *Worker) releaseLock(ctx context.Context, key string) error {
 	script := `if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) else return 0 end`
-	_, err := w.RDB.Eval(ctx, script, []string{key}, w.ConsumerName).Result()
+	v, err := w.RDB.Eval(ctx, script, []string{key}, w.ConsumerName).Result()
 	if err == redis.Nil {
 		return nil
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	if n, ok := v.(int64); ok && n == 0 {
+		return fmt.Errorf("lock not owned or already expired")
+	}
+	return nil
 }
 
 func (w *Worker) renewLock(ctx context.Context, key string) (bool, error) {
