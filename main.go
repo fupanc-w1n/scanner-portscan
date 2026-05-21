@@ -124,31 +124,12 @@ func handlePort(ctx context.Context, cfg *scannerconfig.Config, mc *scannerconfi
 		return worker.HandlerResult{Err: fmt.Errorf("insert ports: %w", err)}
 	}
 
-	// 任务终止检查
-	term, err := mdb.IsTaskTerminated(ctx, msg.TaskID)
-	if err != nil {
-		return worker.HandlerResult{Err: fmt.Errorf("check task terminated: %w", err)}
-	}
-	if term {
-		if err := mdb.SetPortScanCompleted(ctx, msg.TaskID, msg.TaskPartName); err != nil {
-			return worker.HandlerResult{Err: err}
-		}
-		if _, err := mdb.MarkPartCompletedIfAllDone(ctx, msg.TaskID, msg.TaskPartName); err != nil {
-			return worker.HandlerResult{Err: err}
-		}
-		return worker.HandlerResult{}
-	}
-
 	openHosts := make([]string, 0, len(openByHost))
 	for _, h := range msg.Hosts {
 		if _, ok := openByHost[h]; ok {
 			openHosts = append(openHosts, h)
 		}
 	}
-	log.Printf("portscan task=%d part=%s scanned_hosts=%d open_hosts=%d result_rows=%d", msg.TaskID, msg.TaskPartName, len(msg.Hosts), len(openHosts), len(rows))
-	recordTaskEvent(ctx, mdb, msg.TaskID, "portscan",
-		fmt.Sprintf("portscan part completed: part=%s scanned_hosts=%d open_hosts=%d open_ports=%d", msg.TaskPartName, len(msg.Hosts), len(openHosts), len(rows)),
-		map[string]interface{}{"task_part_name": msg.TaskPartName, "scanned_hosts": len(msg.Hosts), "open_hosts": len(openHosts), "open_ports": len(rows)})
 
 	// 无开放 host:把所有非 NULL 模块字段标完成,然后检查分片完成,不投递下游
 	if len(openHosts) == 0 {
@@ -158,6 +139,10 @@ func handlePort(ctx context.Context, cfg *scannerconfig.Config, mc *scannerconfi
 		if _, err := mdb.MarkPartCompletedIfAllDone(ctx, msg.TaskID, msg.TaskPartName); err != nil {
 			return worker.HandlerResult{Err: err}
 		}
+		log.Printf("portscan task=%d part=%s scanned_hosts=%d open_hosts=%d result_rows=%d", msg.TaskID, msg.TaskPartName, len(msg.Hosts), len(openHosts), len(rows))
+		recordTaskEvent(ctx, mdb, msg.TaskID, "portscan",
+			fmt.Sprintf("portscan part completed: part=%s scanned_hosts=%d open_hosts=%d open_ports=%d", msg.TaskPartName, len(msg.Hosts), len(openHosts), len(rows)),
+			map[string]interface{}{"task_part_name": msg.TaskPartName, "scanned_hosts": len(msg.Hosts), "open_hosts": len(openHosts), "open_ports": len(rows)})
 		return worker.HandlerResult{}
 	}
 
@@ -177,6 +162,10 @@ func handlePort(ctx context.Context, cfg *scannerconfig.Config, mc *scannerconfi
 	if _, err := mdb.MarkPartCompletedIfAllDone(ctx, msg.TaskID, msg.TaskPartName); err != nil {
 		return worker.HandlerResult{Err: err}
 	}
+	log.Printf("portscan task=%d part=%s scanned_hosts=%d open_hosts=%d result_rows=%d", msg.TaskID, msg.TaskPartName, len(msg.Hosts), len(openHosts), len(rows))
+	recordTaskEvent(ctx, mdb, msg.TaskID, "portscan",
+		fmt.Sprintf("portscan part completed: part=%s scanned_hosts=%d open_hosts=%d open_ports=%d", msg.TaskPartName, len(msg.Hosts), len(openHosts), len(rows)),
+		map[string]interface{}{"task_part_name": msg.TaskPartName, "scanned_hosts": len(msg.Hosts), "open_hosts": len(openHosts), "open_ports": len(rows)})
 	return out
 }
 

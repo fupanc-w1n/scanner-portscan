@@ -363,13 +363,3 @@ func (d *DB) MarkTaskCompletedIfAllDone(ctx context.Context, taskID uint64) erro
 	_, err := d.conn.ExecContext(ctx, q, now, now, taskID, taskID)
 	return err
 }
-
-// IsTaskTerminated 检查任务是否已被前端终止
-func (d *DB) IsTaskTerminated(ctx context.Context, taskID uint64) (bool, error) {
-	row := d.conn.QueryRowContext(ctx, `SELECT status FROM tasks WHERE id=?`, taskID)
-	var s string
-	if err := row.Scan(&s); err != nil {
-		return false, err
-	}
-	return s == "terminated", nil
-}
