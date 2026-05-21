@@ -57,7 +57,7 @@ func main() {
 	}
 	defer rdb.Close()
 
-	mdb, err := mysqldb.Open(cfg.MySQLAddr(), envOr("DAST_DB_USER", "root"), envOr("DAST_DB_PASS", "fupanC@123"), envOr("DAST_DB_NAME", "dast"))
+	mdb, err := mysqldb.Open(cfg.MySQLAddr(), envOr("DAST_DB_USER", "root"), envOr("DAST_DB_PASS", "root"), envOr("DAST_DB_NAME", "dast"))
 	if err != nil {
 		log.Fatalf("mysql open: %v", err)
 	}
